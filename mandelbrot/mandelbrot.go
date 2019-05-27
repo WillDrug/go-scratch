@@ -6,112 +6,127 @@ import (
     "image/color"
     // "image/draw"
     "image/png"
-    "os"
-    "strconv"
+    "flag"
+    // "strconv"
     "gopkg.in/cheggaaa/pb.v1"
+    "time"
+    "os"
 )
 
-var mandelColor color.Color = color.RGBA{0, 204, 102, 153}
-var mag float64 = 120.0 // todo move to ARgs
+var mandelColor color.Color = color.RGBA{255, 255, 255, 255}
+var mh, mw int
+var mag int
+var mx, my int
 
-func drawMandelbrot(mw, mh int, img *image.RGBA) {
+type MandelPoint struct {
+	x int      // img x
+	y int 	   // img y
+	zR float64 // final complex plain value
+	zX float64 // final real plain value
+	r int 	   // number of iterations by which cR skyrocketed to INF; always 255 if within the set
+}
+
+func calculatePoint(x, y, imx, imy, imag int, retch *chan MandelPoint) {
+	// x, y are points on a image plain
+	// mx, my are by how much the mandelbrot set is moved
+	// mag is mandelbrot set magnification.
+	// mx, my, mag parms are there to move the mandelbrot set on the real and complex plains and magnify it
 	var cR, cX, zR, zX, swp float64
 	var r int
-	var mandelbrot []bool
-	mandelbrot = make([]bool, mw*mh)
+	cR = float64(x+imx)/float64(imag)
+	cX = float64(y+imy)/float64(imag)
+	zR = 0.0
+	zX = 0.0
+	for r=0; r < 255 && zR < 2; r++ { // 255 iterations go into uint8 and are enough 
+		swp = zR
+		zR = zR*zR + -1*(zX*zX) + cR // calculation gets rid of complex "i" making it possible to do in a program
+		zX = 2*swp*zX + cX
+	}
+	*retch <- MandelPoint{x, y, zR, zX, r}
+}
+
+func populateMandelbrot(mandelset *[][]MandelPoint) {
 	var bar *pb.ProgressBar
-	bar = pb.StartNew(mw*mh)
-
-	for y:=0.0; y<float64(mh); y++ {
-		for x:=0.0; x<float64(mw); x++ {
-			cR = x/mag
-			cX = y/mag
-			zR = 0.0
-			zX = 0.0
-			for r=0; r < 50 && zR < 2; r++ {
-			    swp = zR
-				zR = zR*zR + -1*(zX*zX) + cR
-				zX = 2*swp*zX + cX
-				r += 1
-			}
-			if zR > 2 {
-			    // x, y is in set
-			    // array holds rows, so 3d row starts at mw*3+0
-				mandelbrot[int(y)*mw+int(x)] = true
-		 	} 
-		 	bar.Increment()
+	afterCh := time.After(30 * time.Second)
+	var retch chan MandelPoint
+	retch = make(chan MandelPoint)
+	bar = pb.StartNew(mw*mh)	
+	for i, row := range *mandelset {
+		for j := range row {
+			go calculatePoint(i, j, mx, my, mag, &retch)
+			bar.Increment()
 		}
 	}
-		
-	bar.FinishPrint("Booled this up")
+	bar.FinishPrint("Ran go-routines")
+	var tmp MandelPoint
 
-	// second cycle, keeping it neighbour-point-aware
+	bar = pb.StartNew(mw*mh)	
+	for i:= 0; i<len(*mandelset); i++ {
+		for j:= 0; j<len((*mandelset)[0]); j++ { // presuming exact number of return values
+			select {
+				case tmp = <-retch:
+					(*mandelset)[tmp.y][tmp.x] = tmp
+				case <-afterCh:
+					panic("TIME'S UP")
+			}
+			bar.Increment()
+		}
+	}
+	bar.FinishPrint("Gathered results")
+}
+
+func drawImg(mandelset *[][]MandelPoint) (*image.RGBA) {
 	var clr color.Color
-	var trp uint8
-	var points [8]int
-	var cntf, cntt int
-	bar = pb.StartNew(mw*mh)
-	for y:=0; y<mh; y++ {
-		for x:=0; x<mw; x++ {
-			if mandelbrot[y*mw+x] {
-				img.Set(x,y,mandelColor)
-			} else {
-				// transparency [0..255] equals 255*adjacent false/adjacent true
-				// 8 points from top left to bottom right
-				cntf,cntt = 0, 0
-				points[0] = (y-1)*mw+x-1
-				points[1] = (y-1)*mw+x
-				points[2] = (y-1)*mw+x+1
-				points[3] = y*mw+x-1
-				points[4] = y*mw+x+1
-				points[5] = (y+1)*mw+x-1
-				points[6] = (y+1)*mw+x
-				points[7] = (y+1)*mw+x+1
-				for p:=0; p<len(points); p++ {
-					if 0 < points[p] && points[p] < len(mandelbrot)-1 {
-						if mandelbrot[points[p]] {
-							cntt++
-						} else {
-							cntf++
-						}
-					}
-				}
-
-				trp = uint8(cntf/(cntt+cntf))
-				clr = color.RGBA{trp, 0, 0, 0}
-				img.Set(x,y,clr)
-				bar.Increment()
+	h := len(*mandelset)
+	w := len((*mandelset)[0]) // presuming it exists because we don't do zero-length images
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for _, row := range *mandelset {
+		for _, p := range row {
+			if p.zR < 2 { // flippable
+				clr = mandelColor
+			} else { // todo: think how to color this to be pwetty
+				clr = color.RGBA{uint8(p.zR), uint8(p.x), uint8(p.y), uint8(p.r)}
 			}
+			// x-y controls GB, red is the final Real value, transparency is based on the number of iterations it took to go over
+			// since the number of iterations goes up to 255, points inside the set will all be fully opaque
+			img.Set(p.x, p.y, clr)
 		}
 	}
-	bar.FinishPrint("Colored Up")
-	
+	return img
+}
 
+func saveImg(img *image.RGBA, fn string) {
+	f, err := os.Create(fn)
+	if err != nil {
+	    panic(err)
+	}
+	defer f.Close()
+	png.Encode(f, img)
 }
 
 func main() {
-	var w, h int
-	if len(os.Args)>1 {
-		tw, _ := strconv.ParseInt(os.Args[1], 10, 32)
-		th, _ := strconv.ParseInt(os.Args[2], 10, 32)
-		w = int(tw)
-		h = int(th)
+	var f string
+
+	// this weird flag re-assigning is due to go ignoring flags for some reason :(
+	flag.IntVar(&mh, "height", 250, "img height")
+	flag.IntVar(&mw, "width", 250, "img width")
+	flag.IntVar(&mx, "mx", 0, "set complex shift")
+	flag.IntVar(&my, "my", 0, "set real shift") // positive is up all's ok
+	flag.IntVar(&mag, "mag", 120, "set magnification")
+	flag.StringVar(&f, "fn", "mandel.png", "output image file name")
+	flag.Parse()
+	mx = -mx // this is done so positive is right
+
+	if mh == 0 || mw == 0 {
+		fmt.Println("Complex plains are no reason to generate 0px images, dude")
 	} else {
-		w = 250
-		h = 250
-	}
-
-    file, err := os.Create("someimage.png")
-
-    if err != nil {
-        fmt.Errorf("%s", err)
-        panic(err)
+    	var mandelbrot [][]MandelPoint
+    	mandelbrot = make([][]MandelPoint, mh)
+    	for i:=0;i<mw;i++ {
+    		mandelbrot[i] = make([]MandelPoint, mw)
+    	}
+    	populateMandelbrot(&mandelbrot)
+    	img := drawImg(&mandelbrot) // no copying D:
+    	saveImg(img, f)
     }
-
-    // this returns a bloody pointer
-    img := image.NewRGBA(image.Rect(0, 0, w, h))
-
-    drawMandelbrot(w, h, img)
-
-    png.Encode(file, img)
 }
